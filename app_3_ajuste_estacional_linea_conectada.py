@@ -2,6 +2,7 @@ import io
 import numpy as np
 import pandas as pd
 import streamlit as st
+import altair as alt
 from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
 try:
     from catboost import CatBoostRegressor
@@ -430,6 +431,70 @@ def forecast_2026_integrado(df, peso_estructural, peso_estacional, umbral, calib
                 "Indice_estacional":idx,"Ajuste_aplicado":ap,"Pred_estacional":pa,
                 "Factor_antisesgo":factor,"Prediccion_final":pf})
     return pd.DataFrame(filas)
+
+
+def grafica_ventas_mensuales(df_historico, pronostico=None, categoria="TODAS",
+                             excluir_combos=True, codigo="TODOS"):
+    """Muestra ventas mensuales reales y forecast final Nov-Dic 2026."""
+    h = df_historico.copy()
+    if "COMBOS" not in h.columns:
+        h["COMBOS"] = 0
+    h["COMBOS"] = pd.to_numeric(h["COMBOS"], errors="coerce").fillna(0).astype(int)
+
+    if excluir_combos:
+        h = h[h["COMBOS"] == 0]
+    if categoria and categoria != "TODAS":
+        h = h[h["CATEGORIA"].astype(str).str.strip() == str(categoria).strip()]
+    if codigo and codigo != "TODOS":
+        h = h[h["CODIGO"].astype(str) == str(codigo)]
+
+    hist = h.groupby(["AÑO", "MES_NUM"], as_index=False)["VENTA"].sum()
+    hist["Fecha"] = pd.to_datetime(dict(
+        year=hist["AÑO"].astype(int), month=hist["MES_NUM"].astype(int), day=1
+    ))
+    hist = hist.rename(columns={"VENTA": "Valor"})
+    hist["Serie"] = "Venta real"
+    partes = [hist[["Fecha", "Valor", "Serie"]]]
+
+    if pronostico is not None and not pronostico.empty:
+        futuro = pronostico.copy()
+        if "COMBOS" not in futuro.columns:
+            futuro["COMBOS"] = 0
+        futuro["COMBOS"] = pd.to_numeric(futuro["COMBOS"], errors="coerce").fillna(0).astype(int)
+        if excluir_combos:
+            futuro = futuro[futuro["COMBOS"] == 0]
+        if categoria and categoria != "TODAS":
+            futuro = futuro[futuro["CATEGORIA"].astype(str).str.strip() == str(categoria).strip()]
+        if codigo and codigo != "TODOS":
+            futuro = futuro[futuro["CODIGO"].astype(str) == str(codigo)]
+        if not futuro.empty:
+            futuro = futuro.groupby("Periodo", as_index=False)["Prediccion_final"].sum()
+            futuro["Fecha"] = pd.to_datetime(dict(
+                year=(futuro["Periodo"] // 100).astype(int),
+                month=(futuro["Periodo"] % 100).astype(int), day=1
+            ))
+            futuro = futuro.rename(columns={"Prediccion_final": "Valor"})
+            futuro["Serie"] = "Forecast 2026"
+            partes.append(futuro[["Fecha", "Valor", "Serie"]])
+
+    datos = pd.concat(partes, ignore_index=True).sort_values("Fecha")
+    if datos.empty:
+        st.warning("No hay datos para la selección actual.")
+        return
+
+    grafica = alt.Chart(datos).mark_line(point=True, strokeWidth=3).encode(
+        x=alt.X("Fecha:T", title="Mes", axis=alt.Axis(format="%b %Y", labelAngle=-45)),
+        y=alt.Y("Valor:Q", title="Venta", axis=alt.Axis(format="$,.2s")),
+        color=alt.Color("Serie:N", title="Serie",
+            scale=alt.Scale(domain=["Venta real", "Forecast 2026"],
+                            range=["#2F6BFF", "#F59E0B"])),
+        tooltip=[
+            alt.Tooltip("Fecha:T", title="Mes", format="%B %Y"),
+            alt.Tooltip("Serie:N", title="Serie"),
+            alt.Tooltip("Valor:Q", title="Venta", format="$,.2f"),
+        ],
+    ).properties(height=430).interactive()
+    st.altair_chart(grafica, use_container_width=True)
 
 
 archivos = st.file_uploader("Carga VENTAS 2024, 2025 y 2026", type=["xlsx"], accept_multiple_files=True)
