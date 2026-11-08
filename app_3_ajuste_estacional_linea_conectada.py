@@ -321,7 +321,9 @@ def backtest_integrado(df, periodos, peso_estructural=.15, peso_estacional=.70,
             pb=(1-peso_estructural)*vd + peso_estructural*ve
             pa,ref,idx,ap=ajustar_estacional(pb,h,int(rr.Periodo),peso_estacional,umbral)
             pf,factor=(pa,1.0) if calibrador is None else aplicar_antisesgo(pa,rr.CATEGORIA,int(rr.Periodo),calibrador)
-            filas.append({"CODIGO":codigo,"CATEGORIA":rr.CATEGORIA,"Periodo":int(rr.Periodo),
+            filas.append({"CODIGO":codigo,"DESCRIPCION":rr.get("DESCRIPCION", ""),
+                "CATEGORIA":rr.CATEGORIA,"COMBOS":int(rr.get("COMBOS", 0)),
+                "Periodo":int(rr.Periodo),
                 "Actual":float(rr.VENTA),"Venta_directa":vd,"Unidades_pred":u,"Precio_pred":pr,
                 "Venta_estructural":ve,"Pred_base_hibrida":pb,"Referencia_estacional":ref,
                 "Indice_estacional":idx,"Ajuste_aplicado":ap,"Pred_estacional":pa,
@@ -340,6 +342,58 @@ def optimizar_peso_estructural(df, peso_estacional=.70, umbral=1.10):
         detalles[round(float(pe),2)]=d
     t=pd.DataFrame(filas).sort_values(["Score","WAPE","RMSE"])
     return t, detalles
+
+
+
+def metricas_por_categoria(datos, columna_pred="Pred_estacional", excluir_combos=False):
+    """Calcula metricas correctamente sobre registros SKU-mes por categoria."""
+    d = datos.copy()
+    if excluir_combos:
+        d = d[pd.to_numeric(d["COMBOS"], errors="coerce").fillna(0).astype(int) == 0]
+    filas = []
+    for categoria, g in d.groupby("CATEGORIA", dropna=False):
+        m = metricas(g["Actual"], g[columna_pred])
+        filas.append({
+            "CATEGORIA": str(categoria),
+            "SKU": int(g["CODIGO"].nunique()),
+            "Registros": int(len(g)),
+            "Venta_real": float(g["Actual"].sum()),
+            "Pronostico": float(g[columna_pred].sum()),
+            **m,
+        })
+    if not filas:
+        return pd.DataFrame()
+    return pd.DataFrame(filas).sort_values("Venta_real", ascending=False).reset_index(drop=True)
+
+
+def comparacion_segmento(datos, excluir_combos=False):
+    d = datos.copy()
+    if excluir_combos:
+        d = d[pd.to_numeric(d["COMBOS"], errors="coerce").fillna(0).astype(int) == 0]
+    modelos = [
+        ("Venta directa", "Venta_directa"),
+        ("Hibrido sin ajuste", "Pred_base_hibrida"),
+        ("Hibrido + estacional", "Pred_estacional"),
+    ]
+    filas = []
+    for nombre, col in modelos:
+        m = metricas(d["Actual"], d[col])
+        filas.append({"Modelo": nombre, "SKU": int(d.CODIGO.nunique()),
+                      "Venta_real": float(d.Actual.sum()),
+                      "Pronostico": float(d[col].sum()), **m})
+    return pd.DataFrame(filas)
+
+
+def mostrar_tabla_metricas(tabla):
+    if tabla.empty:
+        st.warning("No hay registros para este segmento.")
+        return
+    formato = {
+        "Venta_real": "${:,.2f}", "Pronostico": "${:,.2f}",
+        "WAPE": "{:.2f}%", "MAE": "${:,.2f}", "RMSE": "${:,.2f}",
+        "R2": "{:.3f}", "SESGO": "{:+.2f}%",
+    }
+    st.dataframe(tabla.style.format(formato), use_container_width=True, hide_index=True)
 
 
 def forecast_2026_integrado(df, peso_estructural, peso_estacional, umbral, calibrador):
@@ -397,14 +451,50 @@ if archivos:
             # No se presenta esta metrica como validacion independiente, porque usa 2025 para calibrar.
             st.info(f"Factor global antisesgo parcial: {calibrador['global']:.3f}. Se reservará para el forecast 2026.")
 
-            st.subheader("2. Comparación honesta Nov-Dic 2025")
-            compar=[]
-            for nombre,col in [("Venta directa","Venta_directa"),("Híbrido sin ajuste","Pred_base_hibrida"),
-                               ("Híbrido + estacional","Pred_estacional")]:
-                m=metricas(bt_base.Actual,bt_base[col]); compar.append({"Modelo":nombre,**m})
-            st.dataframe(pd.DataFrame(compar).style.format({"WAPE":"{:.2f}%","MAE":"${:,.2f}",
-                "RMSE":"${:,.2f}","R2":"{:.3f}","SESGO":"{:+.2f}%"}),use_container_width=True,hide_index=True)
-            st.caption("El factor antisesgo no se reporta como mejora de 2025 porque fue aprendido con ese mismo periodo.")
+            st.subheader("2. Comparacion honesta Nov-Dic 2025")
+            tab_total, tab_sin_combo, tab_categoria, tab_cat_sin_combo = st.tabs([
+                "Total", "Total sin combos", "Por categoria", "Por categoria sin combos"
+            ])
+
+            with tab_total:
+                comp_total = comparacion_segmento(bt_base, excluir_combos=False)
+                mostrar_tabla_metricas(comp_total)
+
+            with tab_sin_combo:
+                comp_sin = comparacion_segmento(bt_base, excluir_combos=True)
+                mostrar_tabla_metricas(comp_sin)
+                eliminados = bt_base[bt_base["COMBOS"].astype(int) == 1]["CODIGO"].nunique()
+                st.caption(f"Se excluyeron {eliminados:,} SKU identificados como combo.")
+
+            with tab_categoria:
+                modelo_cat = st.selectbox(
+                    "Modelo para metricas por categoria",
+                    ["Hibrido + estacional", "Venta directa", "Hibrido sin ajuste"],
+                    key="modelo_categoria_total",
+                )
+                mapa_col = {"Hibrido + estacional":"Pred_estacional",
+                            "Venta directa":"Venta_directa",
+                            "Hibrido sin ajuste":"Pred_base_hibrida"}
+                cat_total = metricas_por_categoria(bt_base, mapa_col[modelo_cat], False)
+                mostrar_tabla_metricas(cat_total)
+                st.download_button("Descargar metricas por categoria", cat_total.to_csv(index=False).encode("utf-8-sig"),
+                                   "metricas_categoria_nov_dic_2025.csv", "text/csv")
+
+            with tab_cat_sin_combo:
+                modelo_cat_sc = st.selectbox(
+                    "Modelo para metricas por categoria sin combos",
+                    ["Hibrido + estacional", "Venta directa", "Hibrido sin ajuste"],
+                    key="modelo_categoria_sin_combo",
+                )
+                mapa_col_sc = {"Hibrido + estacional":"Pred_estacional",
+                               "Venta directa":"Venta_directa",
+                               "Hibrido sin ajuste":"Pred_base_hibrida"}
+                cat_sin = metricas_por_categoria(bt_base, mapa_col_sc[modelo_cat_sc], True)
+                mostrar_tabla_metricas(cat_sin)
+                st.download_button("Descargar categorias sin combos", cat_sin.to_csv(index=False).encode("utf-8-sig"),
+                                   "metricas_categoria_sin_combos_nov_dic_2025.csv", "text/csv")
+
+            st.caption("WAPE se calcula como suma del error absoluto dividida entre la venta real de cada categoria. El factor antisesgo no se presenta como mejora de 2025 porque fue aprendido con ese mismo periodo.")
 
             st.subheader("3. Forecast noviembre-diciembre 2026")
             if st.button("Generar forecast final 2026", type="primary"):
@@ -420,3 +510,4 @@ if archivos:
         st.exception(e)
 else:
     st.info("Carga los tres archivos Excel para comenzar.")
+
