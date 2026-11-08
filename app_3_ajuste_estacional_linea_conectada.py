@@ -9,7 +9,7 @@ except ImportError:
     CatBoostRegressor = None
 
 st.set_page_config(page_title="Forecast venta, unidades y precio", layout="wide")
-st.title("Forecast CatBoost: venta + unidades x precio y mas")
+st.title("Forecast CatBoost: venta + unidades x precio")
 
 MESES = {m: i + 1 for i, m in enumerate([
     "ENERO", "FEBRERO", "MARZO", "ABRIL", "MAYO", "JUNIO",
@@ -447,6 +447,26 @@ if archivos:
         with st.expander("Diagnóstico de carga"):
             st.dataframe(diagnostico, use_container_width=True, hide_index=True)
 
+        st.subheader("Evolución mensual de ventas")
+        categorias_grafica = ["TODAS"] + sorted(df["CATEGORIA"].astype(str).str.strip().unique().tolist())
+        col_g1, col_g2, col_g3 = st.columns([2, 2, 1])
+        with col_g1:
+            categoria_grafica = st.selectbox("Categoría", categorias_grafica, key="categoria_grafica_mensual")
+        df_codigos_grafica = df.copy()
+        if categoria_grafica != "TODAS":
+            df_codigos_grafica = df_codigos_grafica[df_codigos_grafica["CATEGORIA"].astype(str).str.strip() == categoria_grafica]
+        with col_g2:
+            codigo_grafica = st.selectbox("Producto", ["TODOS"] + sorted(df_codigos_grafica["CODIGO"].astype(str).unique().tolist()), key="codigo_grafica_mensual")
+        with col_g3:
+            quitar_combos_grafica = st.checkbox("Excluir combos", value=True, key="quitar_combos_grafica")
+        pron_grafica = st.session_state.get("pron_final", pd.DataFrame())
+        grafica_ventas_mensuales(df, pronostico=pron_grafica, categoria=categoria_grafica,
+                                 excluir_combos=quitar_combos_grafica, codigo=codigo_grafica)
+        if pron_grafica.empty:
+            st.caption("Histórico mensual 2024-2026. Al generar el forecast aparecerán noviembre y diciembre de 2026 en naranja.")
+        else:
+            st.caption("Azul: venta real mensual. Naranja: forecast final noviembre-diciembre de 2026.")
+
         st.subheader("1. Optimización del peso unidades × precio")
         st.caption("Busca de 0% a 30%. Nov-Dic 2025 se usa como validación, no como entrenamiento.")
         if st.button("Optimizar modelo integrado", type="primary"):
@@ -549,6 +569,9 @@ if archivos:
                         Prediccion_final=("Prediccion_final", "sum"),
                     )
                     st.markdown(f"#### {categoria_sel}")
+                    st.markdown("##### Ventas mensuales históricas y forecast")
+                    grafica_ventas_mensuales(df, pronostico=pron, categoria=categoria_sel,
+                                             excluir_combos=True, codigo="TODOS")
                     st.dataframe(
                         resumen_categoria.style.format({
                             "Unidades_pred": "{:,.0f}",
