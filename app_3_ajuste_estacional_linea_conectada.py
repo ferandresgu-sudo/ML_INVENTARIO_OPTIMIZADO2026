@@ -433,6 +433,80 @@ def forecast_2026_integrado(df, peso_estructural, peso_estacional, umbral, calib
     return pd.DataFrame(filas)
 
 
+
+def optimizar_configuracion_modelo(df):
+    """Búsqueda secuencial robusta para Nov-Dic 2025.
+
+    Etapa 1: peso estructural 0%-30%.
+    Etapa 2: peso forecast estacional y umbral.
+    Etapa 3: recomienda antisesgo conservador sin usarlo para inflar la métrica 2025.
+    """
+    resultados_etapa1 = []
+    detalles_etapa1 = {}
+    for peso_estructural in np.arange(0.00, 0.31, 0.05):
+        bt = backtest_integrado(
+            df, [202511, 202512], float(peso_estructural), 0.70, 1.10, None
+        )
+        if bt.empty:
+            continue
+        bt_sc = bt[bt["COMBOS"].astype(int) == 0].copy()
+        m = metricas(bt_sc.Actual, bt_sc.Pred_estacional)
+        score = m["WAPE"] + 0.00002 * m["RMSE"] + 0.25 * abs(m["SESGO"])
+        resultados_etapa1.append({
+            "Peso_estructural": float(peso_estructural), **m, "Score": score
+        })
+        detalles_etapa1[round(float(peso_estructural), 2)] = bt
+    tabla1 = pd.DataFrame(resultados_etapa1).sort_values("Score")
+    if tabla1.empty:
+        return pd.DataFrame(), None, None
+    mejor_pe = float(tabla1.iloc[0]["Peso_estructural"])
+
+    resultados_etapa2 = []
+    detalles_etapa2 = {}
+    for peso_estacional in [0.55, 0.65, 0.70, 0.75, 0.85]:
+        for umbral in [1.00, 1.05, 1.10, 1.15, 1.20]:
+            bt = backtest_integrado(
+                df, [202511, 202512], mejor_pe,
+                float(peso_estacional), float(umbral), None
+            )
+            if bt.empty:
+                continue
+            bt_sc = bt[bt["COMBOS"].astype(int) == 0].copy()
+            m = metricas(bt_sc.Actual, bt_sc.Pred_estacional)
+            # Penaliza sesgo y RMSE para no elegir una configuración que solo minimice WAPE.
+            score = m["WAPE"] + 0.00002 * m["RMSE"] + 0.25 * abs(m["SESGO"])
+            clave = (float(peso_estacional), float(umbral))
+            resultados_etapa2.append({
+                "Peso_estructural": mejor_pe,
+                "Peso_forecast_estacional": clave[0],
+                "Umbral_estacional": clave[1],
+                **m, "Score": score,
+            })
+            detalles_etapa2[clave] = bt
+    tabla2 = pd.DataFrame(resultados_etapa2).sort_values("Score")
+    if tabla2.empty:
+        return tabla1, None, None
+
+    ganador = tabla2.iloc[0].to_dict()
+    clave = (ganador["Peso_forecast_estacional"], ganador["Umbral_estacional"])
+    bt_ganador = detalles_etapa2[clave]
+    sesgo = float(ganador["SESGO"])
+
+    # Antisesgo se recomienda, pero no se optimiza contra el mismo 2025 para evitar fuga.
+    if sesgo <= -10:
+        intensidad, tope = 0.70, 1.10
+    elif sesgo <= -5:
+        intensidad, tope = 0.60, 1.08
+    elif sesgo < -2:
+        intensidad, tope = 0.45, 1.06
+    elif sesgo >= 5:
+        intensidad, tope = 0.35, 1.04
+    else:
+        intensidad, tope = 0.25, 1.04
+    ganador["Intensidad_antisesgo"] = intensidad
+    ganador["Tope_antisesgo"] = tope
+    return tabla2.reset_index(drop=True), ganador, bt_ganador
+
 def grafica_ventas_mensuales(df_historico, pronostico=None, categoria="TODAS",
                              excluir_combos=True, codigo="TODOS"):
     """Muestra ventas mensuales reales y forecast final Nov-Dic 2026."""
@@ -532,7 +606,53 @@ if archivos:
         else:
             st.caption("Azul: venta real mensual. Naranja: forecast final noviembre-diciembre de 2026.")
 
-        st.subheader("1. Optimización del peso unidades × precio")
+        st.subheader("1. Búsqueda de la mejor configuración")
+        st.caption(
+            "Optimiza con Nov-Dic 2025 y productos sin combos: peso unidades × precio, "
+            "peso frente a referencia estacional y umbral. La intensidad antisesgo se "
+            "recomienda de forma conservadora para evitar sobreajustar 2025."
+        )
+        if st.button("Buscar mejor configuración completa", type="primary"):
+            with st.spinner("Evaluando configuraciones. Puede tardar varios minutos..."):
+                tabla_config, mejor_config, bt_mejor_config = optimizar_configuracion_modelo(df)
+            st.session_state["tabla_config_completa"] = tabla_config
+            st.session_state["mejor_config"] = mejor_config
+            st.session_state["bt_mejor_config"] = bt_mejor_config
+
+        if st.session_state.get("mejor_config") is not None:
+            mejor_config = st.session_state["mejor_config"]
+            tabla_config = st.session_state["tabla_config_completa"]
+            c1, c2, c3, c4 = st.columns(4)
+            c1.metric("Venta directa", f"{1-mejor_config['Peso_estructural']:.0%}")
+            c2.metric("Unidades × precio", f"{mejor_config['Peso_estructural']:.0%}")
+            c3.metric("Peso forecast", f"{mejor_config['Peso_forecast_estacional']:.0%}")
+            c4.metric("Umbral estacional", f"{mejor_config['Umbral_estacional']:.2f}")
+            c5, c6, c7, c8 = st.columns(4)
+            c5.metric("WAPE sin combos", f"{mejor_config['WAPE']:.2f}%")
+            c6.metric("RMSE", f"${mejor_config['RMSE']:,.0f}")
+            c7.metric("Sesgo", f"{mejor_config['SESGO']:+.2f}%")
+            c8.metric("R²", f"{mejor_config['R2']:.3f}")
+            st.success(
+                f"Configuración recomendada: peso forecast {mejor_config['Peso_forecast_estacional']:.2f}, "
+                f"umbral {mejor_config['Umbral_estacional']:.2f}, intensidad antisesgo "
+                f"{mejor_config['Intensidad_antisesgo']:.2f} y tope {mejor_config['Tope_antisesgo']:.2f}."
+            )
+            st.dataframe(
+                tabla_config.head(10).style.format({
+                    "Peso_estructural":"{:.0%}", "Peso_forecast_estacional":"{:.0%}",
+                    "Umbral_estacional":"{:.2f}", "WAPE":"{:.2f}%",
+                    "MAE":"${:,.2f}", "RMSE":"${:,.2f}", "R2":"{:.3f}",
+                    "SESGO":"{:+.2f}%", "Score":"{:.3f}"
+                }), use_container_width=True, hide_index=True
+            )
+            st.download_button(
+                "Descargar ranking de configuraciones",
+                tabla_config.to_csv(index=False).encode("utf-8-sig"),
+                "ranking_configuraciones_nov_dic_2025.csv", "text/csv"
+            )
+
+        st.divider()
+        st.subheader("2. Optimización rápida del peso unidades × precio")
         st.caption("Busca de 0% a 30%. Nov-Dic 2025 se usa como validación, no como entrenamiento.")
         if st.button("Optimizar modelo integrado", type="primary"):
             with st.spinner("Entrenando y comparando pesos..."):
@@ -545,10 +665,24 @@ if archivos:
                 "WAPE":"{:.2f}%","MAE":"${:,.2f}","RMSE":"${:,.2f}","R2":"{:.3f}","SESGO":"{:+.2f}%"}),
                 use_container_width=True,hide_index=True)
             mejor=float(tabla.iloc[0].Peso_estructural)
+            peso_estacional_activo = peso_estacional
+            umbral_activo = umbral
+            intensidad_activa = intensidad
+            tope_activo = tope
+            if st.session_state.get("mejor_config") is not None:
+                cfg = st.session_state["mejor_config"]
+                mejor = float(cfg["Peso_estructural"])
+                peso_estacional_activo = float(cfg["Peso_forecast_estacional"])
+                umbral_activo = float(cfg["Umbral_estacional"])
+                intensidad_activa = float(cfg["Intensidad_antisesgo"])
+                tope_activo = float(cfg["Tope_antisesgo"])
+                bt_base = st.session_state["bt_mejor_config"]
+                st.success("Se utilizará la configuración completa optimizada para generar el forecast 2026.")
+            else:
+                bt_base=detalles[round(mejor,2)]
             st.success(f"Peso recomendado: {1-mejor:.0%} venta directa + {mejor:.0%} unidades × precio")
 
-            bt_base=detalles[round(mejor,2)]
-            calibrador=factor_antisesgo_regularizado(bt_base,intensidad,tope,prior=30)
+            calibrador=factor_antisesgo_regularizado(bt_base,intensidad_activa,tope_activo,prior=30)
             bt_cal=bt_base.copy()
             ajustes=[aplicar_antisesgo(r.Pred_estacional,r.CATEGORIA,int(r.Periodo),calibrador) for _,r in bt_cal.iterrows()]
             bt_cal["Prediccion"]=[x[0] for x in ajustes]
@@ -603,7 +737,7 @@ if archivos:
             st.subheader("3. Forecast noviembre-diciembre 2026")
             if st.button("Generar forecast final 2026", type="primary"):
                 with st.spinner("Entrenando tres modelos y aplicando ajustes..."):
-                    pron=forecast_2026_integrado(df,mejor,peso_estacional,umbral,calibrador)
+                    pron=forecast_2026_integrado(df,mejor,peso_estacional_activo,umbral_activo,calibrador)
                 st.session_state["pron_final"]=pron
             if "pron_final" in st.session_state:
                 pron=st.session_state["pron_final"]
