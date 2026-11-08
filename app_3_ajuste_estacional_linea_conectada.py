@@ -396,6 +396,24 @@ def mostrar_tabla_metricas(tabla):
     st.dataframe(tabla.style.format(formato), use_container_width=True, hide_index=True)
 
 
+
+def separar_categorias_sin_combos(datos, columna_valor="Prediccion_final"):
+    """Excluye combos y devuelve un diccionario con un DataFrame por categoria."""
+    d = datos.copy()
+    d["COMBOS"] = pd.to_numeric(d.get("COMBOS", 0), errors="coerce").fillna(0).astype(int)
+    d = d[d["COMBOS"] == 0].copy()
+    salida = {}
+    for categoria, g in d.groupby("CATEGORIA", dropna=False):
+        nombre = str(categoria).strip() or "SIN_CATEGORIA"
+        salida[nombre] = g.sort_values(["Periodo", "CODIGO"]).reset_index(drop=True)
+    return salida
+
+
+def nombre_archivo_seguro(texto):
+    import re
+    nombre = re.sub(r"[^A-Za-z0-9_-]+", "_", str(texto).strip())
+    return nombre.strip("_") or "SIN_CATEGORIA"
+
 def forecast_2026_integrado(df, peso_estructural, peso_estacional, umbral, calibrador):
     modelos=entrenar_tres_modelos(df); filas=[]
     for codigo,h in df.groupby("CODIGO"):
@@ -406,6 +424,7 @@ def forecast_2026_integrado(df, peso_estructural, peso_estacional, umbral, calib
             pa,ref,idx,ap=ajustar_estacional(pb,h,periodo,peso_estacional,umbral)
             pf,factor=aplicar_antisesgo(pa,meta.CATEGORIA,periodo,calibrador)
             filas.append({"CODIGO":codigo,"DESCRIPCION":meta.DESCRIPCION,"CATEGORIA":meta.CATEGORIA,
+                "COMBOS":int(meta.get("COMBOS", 0)),
                 "Periodo":periodo,"Venta_directa":vd,"Unidades_pred":u,"Precio_pred":pr,
                 "Venta_estructural":ve,"Pred_base_hibrida":pb,"Referencia_estacional":ref,
                 "Indice_estacional":idx,"Ajuste_aplicado":ap,"Pred_estacional":pa,
@@ -506,6 +525,66 @@ if archivos:
                 st.dataframe(pron,use_container_width=True,hide_index=True)
                 st.download_button("Descargar forecast final CSV",pron.to_csv(index=False).encode("utf-8-sig"),
                     "forecast_integrado_nov_dic_2026.csv","text/csv")
+
+                st.subheader("4. Categorias separadas sin combos")
+                categorias_sin_combo = separar_categorias_sin_combos(pron)
+                if not categorias_sin_combo:
+                    st.warning("No quedaron productos despues de excluir COMBOS = 1.")
+                else:
+                    categorias_disponibles = sorted(categorias_sin_combo)
+                    categoria_sel = st.selectbox(
+                        "Selecciona una categoria sin combos",
+                        categorias_disponibles,
+                        key="categoria_forecast_sin_combo",
+                    )
+                    detalle_categoria = categorias_sin_combo[categoria_sel]
+                    resumen_categoria = detalle_categoria.groupby(
+                        ["CATEGORIA", "Periodo"], as_index=False
+                    ).agg(
+                        SKU=("CODIGO", "nunique"),
+                        Unidades_pred=("Unidades_pred", "sum"),
+                        Venta_directa=("Venta_directa", "sum"),
+                        Venta_estructural=("Venta_estructural", "sum"),
+                        Pred_estacional=("Pred_estacional", "sum"),
+                        Prediccion_final=("Prediccion_final", "sum"),
+                    )
+                    st.markdown(f"#### {categoria_sel}")
+                    st.dataframe(
+                        resumen_categoria.style.format({
+                            "Unidades_pred": "{:,.0f}",
+                            "Venta_directa": "${:,.2f}",
+                            "Venta_estructural": "${:,.2f}",
+                            "Pred_estacional": "${:,.2f}",
+                            "Prediccion_final": "${:,.2f}",
+                        }),
+                        use_container_width=True,
+                        hide_index=True,
+                    )
+                    st.dataframe(detalle_categoria, use_container_width=True, hide_index=True)
+                    archivo_categoria = f"forecast_{nombre_archivo_seguro(categoria_sel)}_sin_combos.csv"
+                    st.download_button(
+                        "Descargar categoria seleccionada sin combos",
+                        detalle_categoria.to_csv(index=False).encode("utf-8-sig"),
+                        archivo_categoria,
+                        "text/csv",
+                    )
+
+                    # ZIP con un CSV independiente por categoria, todos sin combos.
+                    import zipfile
+                    from io import BytesIO
+                    memoria_zip = BytesIO()
+                    with zipfile.ZipFile(memoria_zip, "w", zipfile.ZIP_DEFLATED) as zf:
+                        for categoria, tabla_cat in categorias_sin_combo.items():
+                            zf.writestr(
+                                f"forecast_{nombre_archivo_seguro(categoria)}_sin_combos.csv",
+                                tabla_cat.to_csv(index=False).encode("utf-8-sig"),
+                            )
+                    st.download_button(
+                        "Descargar todas las categorias separadas en ZIP",
+                        memoria_zip.getvalue(),
+                        "forecast_categorias_sin_combos_2026.zip",
+                        "application/zip",
+                    )
     except Exception as e:
         st.exception(e)
 else:
