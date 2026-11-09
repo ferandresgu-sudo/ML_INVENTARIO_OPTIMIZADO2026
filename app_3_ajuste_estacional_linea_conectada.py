@@ -92,11 +92,7 @@ El sesgo negativo indica que el modelo sigue siendo conservador. Las métricas s
 - **Línea naranja punteada:** pronóstico de noviembre y diciembre de 2026.
 - Los filtros permiten analizar categoría, productos sin combos, combos o un SKU individual.
 - El histórico utiliza el mismo universo de SKU activos incluidos en el forecast.
-
-### 7. Alcance
-
-El resultado es adecuado como forecast operativo con revisión comercial. Los combos, lanzamientos, bajas, promociones futuras, faltantes y cambios extraordinarios de distribución requieren validación adicional porque esas decisiones no siempre están presentes en el histórico.
-        """
+"""
     )
 
 with st.expander("Fórmulas principales", expanded=False):
