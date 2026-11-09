@@ -577,6 +577,77 @@ def optimizar_configuracion_modelo_rapido(df, barra=None, estado=None):
         estado.success("Paso 3 de 3: optimización terminada. Resultados guardados.")
     return tabla, ganador, mejor_bt
 
+
+@st.cache_data(show_spinner=False)
+def validar_sep_oct_2026(df, peso_estructural, excluir_combos=True):
+    """Entrena solo hasta agosto 2026 y predice septiembre-octubre 2026.
+
+    No usa ajuste Nov-Dic ni calibracion antisesgo, porque esos componentes son
+    exclusivos de temporada alta. Evita fuga de informacion con Periodo < 202609.
+    """
+    periodos = [202609, 202610]
+    train = df[df["Periodo"] < 202609].copy()
+    real = df[df["Periodo"].isin(periodos)].copy()
+    if train.empty or real.empty:
+        return pd.DataFrame(), pd.DataFrame(), {}
+
+    modelos = entrenar_tres_modelos(train)
+    filas = []
+    codigos = sorted(set(train["CODIGO"]) & set(real["CODIGO"]))
+    for codigo in codigos:
+        hist = train[train["CODIGO"] == codigo].sort_values("Periodo")
+        observado = real[real["CODIGO"] == codigo].sort_values("Periodo")
+        ps = observado["Periodo"].astype(int).tolist()
+        if hist.empty or not ps:
+            continue
+        pv, pu, pp, pe, _ = pronosticar_sku(
+            modelos, hist, ps, peso_directo=1.0 - float(peso_estructural)
+        )
+        for (_, rr), vd, unidades, precio, estructural in zip(
+            observado.iterrows(), pv, pu, pp, pe
+        ):
+            pred = ((1.0 - float(peso_estructural)) * vd
+                    + float(peso_estructural) * estructural)
+            filas.append({
+                "CODIGO": codigo,
+                "DESCRIPCION": rr.get("DESCRIPCION", ""),
+                "CATEGORIA": rr.get("CATEGORIA", "SIN_DATO"),
+                "COMBOS": int(rr.get("COMBOS", 0)),
+                "Periodo": int(rr["Periodo"]),
+                "Actual": float(rr["VENTA"]),
+                "Venta_directa": float(vd),
+                "Unidades_pred": float(unidades),
+                "Precio_pred": float(precio),
+                "Venta_estructural": float(estructural),
+                "Prediccion": max(0.0, float(pred)),
+            })
+
+    detalle = pd.DataFrame(filas)
+    if detalle.empty:
+        return detalle, pd.DataFrame(), {}
+    evaluado = detalle.copy()
+    if excluir_combos:
+        evaluado = evaluado[evaluado["COMBOS"] == 0].copy()
+    if evaluado.empty:
+        return detalle, pd.DataFrame(), {}
+
+    resumen_mes = evaluado.groupby("Periodo", as_index=False).agg(
+        SKU=("CODIGO", "nunique"),
+        Venta_real=("Actual", "sum"),
+        Pronostico=("Prediccion", "sum"),
+    )
+    resumen_mes["Error_pct"] = np.where(
+        resumen_mes["Venta_real"].abs() > 0,
+        100.0 * (resumen_mes["Pronostico"] - resumen_mes["Venta_real"])
+        / resumen_mes["Venta_real"], np.nan
+    )
+    m = metricas(evaluado["Actual"], evaluado["Prediccion"])
+    m["SKU"] = int(evaluado["CODIGO"].nunique())
+    m["Registros"] = int(len(evaluado))
+    m["Venta_real"] = float(evaluado["Actual"].sum())
+    m["Pronostico"] = float(evaluado["Prediccion"].sum())
+    return detalle, resumen_mes, m
+
 def grafica_ventas_mensuales(df_historico, pronostico=None, categoria="TODAS",
                              excluir_combos=True, codigo="TODOS"):
     """Muestra ventas mensuales reales y forecast final Nov-Dic 2026."""
@@ -649,9 +720,11 @@ with st.sidebar:
     intensidad = st.slider("Intensidad antisesgo", 0.0, 1.0, .60, .05)
     tope = st.slider("Tope factor antisesgo", 1.02, 1.20, 1.10, .01)
     if st.button("Limpiar resultados de optimización"):
-        for clave in ["tabla_config_completa", "mejor_config", "bt_mejor_config"]:
+        for clave in ["tabla_config_completa", "mejor_config", "bt_mejor_config",
+                      "detalle_sep_oct_2026", "resumen_sep_oct_2026", "metricas_sep_oct_2026"]:
             st.session_state.pop(clave, None)
         preparar_backtest_base_2025.clear()
+        validar_sep_oct_2026.clear()
         st.rerun()
 
 if archivos:
@@ -822,7 +895,75 @@ if archivos:
 
             st.caption("WAPE se calcula como suma del error absoluto dividida entre la venta real de cada categoria. El factor antisesgo no se presenta como mejora de 2025 porque fue aprendido con ese mismo periodo.")
 
-            st.subheader("3. Forecast noviembre-diciembre 2026")
+            st.subheader("3. Validación septiembre-octubre 2026")
+            st.caption(
+                "Entrena únicamente con datos hasta agosto de 2026 y predice septiembre y octubre. "
+                "Esta prueba mide tendencia reciente sin usar información futura."
+            )
+            excluir_combos_sep_oct = st.checkbox(
+                "Excluir combos en Sep-Oct 2026", value=True,
+                key="excluir_combos_sep_oct_2026"
+            )
+            if st.button("Predecir y validar Sep-Oct 2026", type="primary"):
+                barra_sep_oct = st.progress(0, text="Entrenando hasta agosto 2026...")
+                try:
+                    detalle_so, resumen_so, metricas_so = validar_sep_oct_2026(
+                        df, mejor, excluir_combos=excluir_combos_sep_oct
+                    )
+                    st.session_state["detalle_sep_oct_2026"] = detalle_so
+                    st.session_state["resumen_sep_oct_2026"] = resumen_so
+                    st.session_state["metricas_sep_oct_2026"] = metricas_so
+                    barra_sep_oct.progress(1.0, text="Validación Sep-Oct completada")
+                    st.rerun()
+                except Exception as error_so:
+                    barra_sep_oct.empty()
+                    st.exception(error_so)
+
+            if st.session_state.get("metricas_sep_oct_2026"):
+                mso = st.session_state["metricas_sep_oct_2026"]
+                rso = st.session_state["resumen_sep_oct_2026"]
+                dso = st.session_state["detalle_sep_oct_2026"]
+                s1, s2, s3, s4, s5 = st.columns(5)
+                s1.metric("WAPE Sep-Oct", f"{mso['WAPE']:.2f}%")
+                s2.metric("MAE", f"${mso['MAE']:,.2f}")
+                s3.metric("RMSE", f"${mso['RMSE']:,.2f}")
+                s4.metric("R²", f"{mso['R2']:.3f}")
+                s5.metric("Sesgo", f"{mso['SESGO']:+.2f}%")
+                st.caption(
+                    f"{mso['SKU']:,} SKU y {mso['Registros']:,} registros SKU-mes. "
+                    f"Venta real: ${mso['Venta_real']:,.2f}. Pronóstico: ${mso['Pronostico']:,.2f}."
+                )
+                st.dataframe(
+                    rso.style.format({
+                        "Venta_real": "${:,.2f}", "Pronostico": "${:,.2f}",
+                        "Error_pct": "{:+.2f}%"
+                    }), use_container_width=True, hide_index=True
+                )
+                mt = st.session_state.get("mejor_config")
+                if mt is not None:
+                    comparacion_ventanas = pd.DataFrame([
+                        {
+                            "Ventana": "Nov-Dic 2025",
+                            "WAPE": mt["WAPE"], "MAE": mt["MAE"],
+                            "RMSE": mt["RMSE"], "R2": mt["R2"],
+                            "SESGO": mt["SESGO"],
+                        },
+                        {
+                            "Ventana": "Sep-Oct 2026",
+                            "WAPE": mso["WAPE"], "MAE": mso["MAE"],
+                            "RMSE": mso["RMSE"], "R2": mso["R2"],
+                            "SESGO": mso["SESGO"],
+                        },
+                    ])
+                    st.markdown("#### Comparación de ventanas")
+                    mostrar_tabla_metricas(comparacion_ventanas)
+                st.download_button(
+                    "Descargar detalle Sep-Oct 2026",
+                    dso.to_csv(index=False).encode("utf-8-sig"),
+                    "backtest_sep_oct_2026.csv", "text/csv"
+                )
+
+            st.subheader("4. Forecast noviembre-diciembre 2026")
             if st.button("Generar forecast final 2026", type="primary"):
                 with st.spinner("Entrenando tres modelos y aplicando ajustes..."):
                     pron=forecast_2026_integrado(df,mejor,peso_estacional_activo,umbral_activo,calibrador)
@@ -833,7 +974,7 @@ if archivos:
                 st.download_button("Descargar forecast final CSV",pron.to_csv(index=False).encode("utf-8-sig"),
                     "forecast_integrado_nov_dic_2026.csv","text/csv")
 
-                st.subheader("4. Categorias separadas sin combos")
+                st.subheader("5. Categorias separadas sin combos")
                 categorias_sin_combo = separar_categorias_sin_combos(pron)
                 if not categorias_sin_combo:
                     st.warning("No quedaron productos despues de excluir COMBOS = 1.")
