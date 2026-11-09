@@ -566,7 +566,7 @@ def calcular_metricas(y_real, y_pred):
 
 
 @st.cache_data(show_spinner=False)
-def backtest_suavizado_nov_dic_2025(df, version="piso-parcial-mensual-backtest-v2"):
+def backtest_suavizado_nov_dic_2025(df, version="piso-parcial-mensual-backtest-v3"):
     """Entrena hasta octubre 2025 y predice Nov-Dic 2025 con la regla suavizada."""
     train = df[df["Periodo"] < 202511].copy()
     real = df[df["Periodo"].isin([202511, 202512])].copy()
@@ -633,7 +633,7 @@ def tabla_metricas_por_categoria(detalle):
 
 
 @st.cache_data(show_spinner=False)
-def generar_forecast(df, version_modelo="piso-parcial-mensual-v2"):
+def generar_forecast(df, version_modelo="piso-parcial-mensual-v3"):
     modelos = entrenar_modelos(df)
     filas = []
     periodos = [202611, 202612]
@@ -780,22 +780,38 @@ if archivos:
             st.stop()
 
         st.markdown("### Validación del piso parcial diferenciado por mes")
+        col_limpiar, col_version = st.columns([1, 2])
+        with col_limpiar:
+            if st.button("Limpiar resultados anteriores", type="secondary"):
+                for clave in [
+                    "detalle_backtest_suavizado",
+                    "detalle_backtest_piso_mensual_v2",
+                    "detalle_backtest_piso_mensual_v3",
+                    "forecast_2026",
+                ]:
+                    st.session_state.pop(clave, None)
+                st.cache_data.clear()
+                st.cache_resource.clear()
+                st.success("Resultados anteriores y caché eliminados.")
+                st.rerun()
+        with col_version:
+            st.info("Configuración activa: noviembre 45% | diciembre 60% | versión v3")
         excluir_combos_bt = st.checkbox(
             "Excluir combos del backtest", value=True, key="excluir_combos_backtest"
         )
-        if st.button("Calcular métricas del piso mensual Nov-Dic 2025", type="primary"):
+        if st.button("Calcular métricas 45%/60% Nov-Dic 2025", type="primary"):
             progreso_bt = st.progress(0, text="Entrenando únicamente hasta octubre de 2025...")
             try:
                 detalle_bt = backtest_suavizado_nov_dic_2025(df)
-                st.session_state["detalle_backtest_suavizado"] = detalle_bt
+                st.session_state["detalle_backtest_piso_mensual_v3"] = detalle_bt
                 progreso_bt.progress(1.0, text="Backtest completado")
                 st.rerun()
             except Exception as error_bt:
                 progreso_bt.empty()
                 st.exception(error_bt)
 
-        if "detalle_backtest_suavizado" in st.session_state:
-            detalle_bt = st.session_state["detalle_backtest_suavizado"].copy()
+        if "detalle_backtest_piso_mensual_v3" in st.session_state:
+            detalle_bt = st.session_state["detalle_backtest_piso_mensual_v3"].copy()
             evaluado_bt = (
                 detalle_bt[detalle_bt["COMBOS"] == 0].copy()
                 if excluir_combos_bt else detalle_bt.copy()
@@ -803,6 +819,38 @@ if archivos:
             if evaluado_bt.empty:
                 st.warning("No quedaron registros para evaluar con el filtro seleccionado.")
             else:
+                comprobacion = (
+                    evaluado_bt.groupby("Periodo", as_index=False)
+                    .agg(
+                        Recuperacion=("Porcentaje_recuperacion", "max"),
+                        Correccion_total=("Correccion_piso", "sum"),
+                        Prediccion_final=("Prediccion_final", "sum"),
+                    )
+                )
+                st.markdown("#### Comprobación de la configuración aplicada")
+                st.dataframe(
+                    comprobacion.style.format({
+                        "Recuperacion": "{:.0%}",
+                        "Correccion_total": "${:,.2f}",
+                        "Prediccion_final": "${:,.2f}",
+                    }),
+                    use_container_width=True,
+                    hide_index=True,
+                )
+                recuperaciones = dict(zip(
+                    comprobacion["Periodo"].astype(int),
+                    comprobacion["Recuperacion"].astype(float),
+                ))
+                if not (
+                    abs(recuperaciones.get(202511, -1) - 0.45) < 1e-9
+                    and abs(recuperaciones.get(202512, -1) - 0.60) < 1e-9
+                ):
+                    st.error(
+                        "La configuración activa no corresponde a 45%/60%. "
+                        "Pulsa Limpiar resultados anteriores y vuelve a ejecutar."
+                    )
+                    st.stop()
+
                 metricas_bt = calcular_metricas(
                     evaluado_bt["Actual"], evaluado_bt["Prediccion_final"]
                 )
@@ -852,7 +900,7 @@ if archivos:
         if "forecast_2026" not in st.session_state:
             st.info("Genera el forecast para habilitar la gráfica de noviembre-diciembre de 2026.")
 
-        if st.button("Generar forecast noviembre-diciembre 2026", type="primary"):
+        if st.button("Generar forecast 2026 con piso 45%/60%", type="primary"):
             with st.spinner("Entrenando el modelo y generando el forecast..."):
                 st.session_state["forecast_2026"] = generar_forecast(df)
             st.rerun()
@@ -1033,3 +1081,4 @@ if archivos:
         st.exception(error)
 else:
     st.info("Carga los tres archivos Excel para comenzar.")
+
