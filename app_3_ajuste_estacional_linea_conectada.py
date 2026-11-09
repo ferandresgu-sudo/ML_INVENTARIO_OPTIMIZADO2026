@@ -462,6 +462,7 @@ def aplicar_ajuste_estacional(pred_base, historial, periodo):
         "Referencia_suavizada": np.nan,
         "Prediccion_combinada": float(pred_base),
         "Piso_parcial": np.nan,
+        "Porcentaje_recuperacion": 0.0,
         "Correccion_piso": 0.0,
         "Ajuste_aplicado": False,
     }
@@ -508,9 +509,21 @@ def aplicar_ajuste_estacional(pred_base, historial, periodo):
     ))
     piso_parcial = ultimo_ano * factor_piso
 
-    # Si queda debajo, solo recupera 40% de la distancia. No copia el piso.
+    # Recuperación diferenciada por mes según el backtest:
+    # noviembre requiere protección moderada y diciembre una protección mayor.
+    if mes == 11:
+        porcentaje_recuperacion = 0.45
+    elif mes == 12:
+        porcentaje_recuperacion = 0.60
+    else:
+        porcentaje_recuperacion = 0.40
+
+    # Si queda debajo, recupera solo una parte de la distancia. No copia el piso.
     if prediccion_combinada < piso_parcial:
-        correccion_piso = 0.40 * (piso_parcial - prediccion_combinada)
+        correccion_piso = (
+            porcentaje_recuperacion
+            * (piso_parcial - prediccion_combinada)
+        )
         prediccion_final = prediccion_combinada + correccion_piso
     else:
         correccion_piso = 0.0
@@ -525,6 +538,7 @@ def aplicar_ajuste_estacional(pred_base, historial, periodo):
         "Referencia_suavizada": float(referencia_suavizada),
         "Prediccion_combinada": float(prediccion_combinada),
         "Piso_parcial": float(piso_parcial),
+        "Porcentaje_recuperacion": float(porcentaje_recuperacion),
         "Correccion_piso": float(correccion_piso),
         "Ajuste_aplicado": True,
     })
@@ -552,7 +566,7 @@ def calcular_metricas(y_real, y_pred):
 
 
 @st.cache_data(show_spinner=False)
-def backtest_suavizado_nov_dic_2025(df, version="piso-parcial-backtest-v1"):
+def backtest_suavizado_nov_dic_2025(df, version="piso-parcial-mensual-backtest-v2"):
     """Entrena hasta octubre 2025 y predice Nov-Dic 2025 con la regla suavizada."""
     train = df[df["Periodo"] < 202511].copy()
     real = df[df["Periodo"].isin([202511, 202512])].copy()
@@ -594,6 +608,7 @@ def backtest_suavizado_nov_dic_2025(df, version="piso-parcial-backtest-v1"):
                 "Referencia_suavizada": diag["Referencia_suavizada"],
                 "Prediccion_combinada": diag["Prediccion_combinada"],
                 "Piso_parcial": diag["Piso_parcial"],
+                "Porcentaje_recuperacion": diag["Porcentaje_recuperacion"],
                 "Correccion_piso": diag["Correccion_piso"],
                 "Ajuste_aplicado": diag["Ajuste_aplicado"],
                 "Prediccion_final": float(pred_final),
@@ -618,7 +633,7 @@ def tabla_metricas_por_categoria(detalle):
 
 
 @st.cache_data(show_spinner=False)
-def generar_forecast(df, version_modelo="piso-parcial-v1"):
+def generar_forecast(df, version_modelo="piso-parcial-mensual-v2"):
     modelos = entrenar_modelos(df)
     filas = []
     periodos = [202611, 202612]
@@ -671,6 +686,7 @@ def generar_forecast(df, version_modelo="piso-parcial-v1"):
                 "Referencia_suavizada": diag["Referencia_suavizada"],
                 "Prediccion_combinada": diag["Prediccion_combinada"],
                 "Piso_parcial": diag["Piso_parcial"],
+                "Porcentaje_recuperacion": diag["Porcentaje_recuperacion"],
                 "Correccion_piso": diag["Correccion_piso"],
                 "Indice_estacional": diag["Indice_estacional"],
                 "Ajuste_aplicado": diag["Ajuste_aplicado"],
@@ -763,11 +779,11 @@ if archivos:
             )
             st.stop()
 
-        st.markdown("### Validación del ajuste con piso parcial")
+        st.markdown("### Validación del piso parcial diferenciado por mes")
         excluir_combos_bt = st.checkbox(
             "Excluir combos del backtest", value=True, key="excluir_combos_backtest"
         )
-        if st.button("Calcular métricas del piso parcial Nov-Dic 2025", type="primary"):
+        if st.button("Calcular métricas del piso mensual Nov-Dic 2025", type="primary"):
             progreso_bt = st.progress(0, text="Entrenando únicamente hasta octubre de 2025...")
             try:
                 detalle_bt = backtest_suavizado_nov_dic_2025(df)
@@ -798,7 +814,7 @@ if archivos:
                 m5.metric("Sesgo", f"{metricas_bt['SESGO']:+.2f}%")
                 st.caption(
                     f"Venta real: ${metricas_bt['REAL']:,.2f} | "
-                    f"Pronóstico con piso parcial: ${metricas_bt['PRED']:,.2f} | "
+                    f"Pronóstico con piso mensual: ${metricas_bt['PRED']:,.2f} | "
                     f"{evaluado_bt['CODIGO'].nunique():,} SKU"
                 )
 
@@ -997,7 +1013,8 @@ if archivos:
                     "CODIGO", "DESCRIPCION", "CATEGORIA", "Periodo",
                     "Prediccion_base", "Referencia_ultimo_ano", "Crecimiento_YTD",
                     "Referencia_YTD", "Prediccion_estacional", "Referencia_suavizada",
-                    "Prediccion_combinada", "Piso_parcial", "Correccion_piso",
+                    "Prediccion_combinada", "Piso_parcial",
+                    "Porcentaje_recuperacion", "Correccion_piso",
                     "Indice_estacional", "Ajuste_aplicado", "Prediccion_final",
                 ]
                 st.dataframe(
@@ -1016,3 +1033,4 @@ if archivos:
         st.exception(error)
 else:
     st.info("Carga los tres archivos Excel para comenzar.")
+
