@@ -10,7 +10,7 @@ except ImportError:
     CatBoostRegressor = None
 
 st.set_page_config(page_title="Forecast venta, unidades y precio", layout="wide")
-st.title("Forecast CatBoost: venta + unidades x precio")
+st.title("Forecast CatBoost: venta + unidades x precio etx")
 
 MESES = {m: i + 1 for i, m in enumerate([
     "ENERO", "FEBRERO", "MARZO", "ABRIL", "MAYO", "JUNIO",
