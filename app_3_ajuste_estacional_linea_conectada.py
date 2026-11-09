@@ -10,7 +10,7 @@ except ImportError:
     CatBoostRegressor = None
 
 st.set_page_config(page_title="Forecast venta, unidades y precio", layout="wide")
-st.title("Forecast CatBoost: venta + unidades x precio etx")
+st.title("Forecast CatBoost: venta + unidades x precio")
 
 MESES = {m: i + 1 for i, m in enumerate([
     "ENERO", "FEBRERO", "MARZO", "ABRIL", "MAYO", "JUNIO",
@@ -434,65 +434,133 @@ def forecast_2026_integrado(df, peso_estructural, peso_estacional, umbral, calib
 
 
 
-def optimizar_configuracion_modelo(df):
-    """Búsqueda secuencial robusta para Nov-Dic 2025.
+@st.cache_data(show_spinner=False)
+def preparar_backtest_base_2025(df):
+    """Entrena los tres CatBoost una sola vez y guarda componentes sin ajuste."""
+    periodos = [202511, 202512]
+    train = df[df["Periodo"] < min(periodos)].copy()
+    real = df[df["Periodo"].isin(periodos)].copy()
+    if train.empty or real.empty:
+        return pd.DataFrame()
 
-    Etapa 1: peso estructural 0%-30%.
-    Etapa 2: peso forecast estacional y umbral.
-    Etapa 3: recomienda antisesgo conservador sin usarlo para inflar la métrica 2025.
-    """
-    resultados_etapa1 = []
-    detalles_etapa1 = {}
-    for peso_estructural in np.arange(0.00, 0.31, 0.05):
-        bt = backtest_integrado(
-            df, [202511, 202512], float(peso_estructural), 0.70, 1.10, None
-        )
-        if bt.empty:
+    modelos = entrenar_tres_modelos(train)
+    filas = []
+    codigos = sorted(set(train["CODIGO"]) & set(real["CODIGO"]))
+    for codigo in codigos:
+        hist = train[train["CODIGO"] == codigo].sort_values("Periodo")
+        r = real[real["CODIGO"] == codigo].sort_values("Periodo")
+        ps = r["Periodo"].astype(int).tolist()
+        if hist.empty or not ps:
             continue
-        bt_sc = bt[bt["COMBOS"].astype(int) == 0].copy()
-        m = metricas(bt_sc.Actual, bt_sc.Pred_estacional)
-        score = m["WAPE"] + 0.00002 * m["RMSE"] + 0.25 * abs(m["SESGO"])
-        resultados_etapa1.append({
-            "Peso_estructural": float(peso_estructural), **m, "Score": score
-        })
-        detalles_etapa1[round(float(peso_estructural), 2)] = bt
-    tabla1 = pd.DataFrame(resultados_etapa1).sort_values("Score")
-    if tabla1.empty:
-        return pd.DataFrame(), None, None
-    mejor_pe = float(tabla1.iloc[0]["Peso_estructural"])
-
-    resultados_etapa2 = []
-    detalles_etapa2 = {}
-    for peso_estacional in [0.55, 0.65, 0.70, 0.75, 0.85]:
-        for umbral in [1.00, 1.05, 1.10, 1.15, 1.20]:
-            bt = backtest_integrado(
-                df, [202511, 202512], mejor_pe,
-                float(peso_estacional), float(umbral), None
-            )
-            if bt.empty:
-                continue
-            bt_sc = bt[bt["COMBOS"].astype(int) == 0].copy()
-            m = metricas(bt_sc.Actual, bt_sc.Pred_estacional)
-            # Penaliza sesgo y RMSE para no elegir una configuración que solo minimice WAPE.
-            score = m["WAPE"] + 0.00002 * m["RMSE"] + 0.25 * abs(m["SESGO"])
-            clave = (float(peso_estacional), float(umbral))
-            resultados_etapa2.append({
-                "Peso_estructural": mejor_pe,
-                "Peso_forecast_estacional": clave[0],
-                "Umbral_estacional": clave[1],
-                **m, "Score": score,
+        venta, unidades, precio, estructural, _ = pronosticar_sku(
+            modelos, hist, ps, peso_directo=1.0
+        )
+        for (_, rr), vd, u, pr, ve in zip(r.iterrows(), venta, unidades, precio, estructural):
+            filas.append({
+                "CODIGO": codigo,
+                "CATEGORIA": rr.get("CATEGORIA", "SIN_DATO"),
+                "COMBOS": int(rr.get("COMBOS", 0)),
+                "Periodo": int(rr["Periodo"]),
+                "Actual": float(rr["VENTA"]),
+                "Venta_directa": float(vd),
+                "Unidades_pred": float(u),
+                "Precio_pred": float(pr),
+                "Venta_estructural": float(ve),
+                # Guardamos lo necesario para recalcular el ajuste sin reentrenar.
+                "Indice_estacional": indice_estacional(hist, int(rr["Periodo"]) // 100),
+                "Crecimiento_ytd": crecimiento_ytd(hist, int(rr["Periodo"]) // 100),
+                "Venta_mismo_mes_1": float(
+                    hist[(hist["MES_NUM"] == int(rr["Periodo"]) % 100) &
+                         (hist["AÑO"] < int(rr["Periodo"]) // 100)]
+                    .sort_values("AÑO")["VENTA"].tail(1).iloc[0]
+                ) if not hist[(hist["MES_NUM"] == int(rr["Periodo"]) % 100) &
+                              (hist["AÑO"] < int(rr["Periodo"]) // 100)].empty else np.nan,
+                "Venta_mismo_mes_2": float(
+                    hist[(hist["MES_NUM"] == int(rr["Periodo"]) % 100) &
+                         (hist["AÑO"] < int(rr["Periodo"]) // 100)]
+                    .sort_values("AÑO")["VENTA"].tail(2).head(1).iloc[0]
+                ) if len(hist[(hist["MES_NUM"] == int(rr["Periodo"]) % 100) &
+                              (hist["AÑO"] < int(rr["Periodo"]) // 100)]) >= 2 else np.nan,
             })
-            detalles_etapa2[clave] = bt
-    tabla2 = pd.DataFrame(resultados_etapa2).sort_values("Score")
-    if tabla2.empty:
-        return tabla1, None, None
+    return pd.DataFrame(filas)
 
-    ganador = tabla2.iloc[0].to_dict()
-    clave = (ganador["Peso_forecast_estacional"], ganador["Umbral_estacional"])
-    bt_ganador = detalles_etapa2[clave]
+
+def evaluar_configuracion_desde_base(base, peso_estructural, peso_forecast, umbral):
+    """Evalúa una combinación sin volver a entrenar CatBoost."""
+    d = base.copy()
+    d["Pred_base_hibrida"] = (
+        (1.0 - peso_estructural) * d["Venta_directa"]
+        + peso_estructural * d["Venta_estructural"]
+    )
+    pred = []
+    for _, r in d.iterrows():
+        pb = float(r["Pred_base_hibrida"])
+        if (r["Periodo"] % 100 not in [11, 12] or
+                r["Indice_estacional"] < umbral or
+                pd.isna(r["Venta_mismo_mes_1"])):
+            pred.append(pb)
+            continue
+        if pd.isna(r["Venta_mismo_mes_2"]):
+            ref_hist = float(r["Venta_mismo_mes_1"])
+        else:
+            ref_hist = 0.65 * float(r["Venta_mismo_mes_1"]) + 0.35 * float(r["Venta_mismo_mes_2"])
+        ref_ytd = ref_hist * float(r["Crecimiento_ytd"])
+        ajustada = peso_forecast * pb + (1.0 - peso_forecast) * ref_ytd
+        piso = float(r["Venta_mismo_mes_1"]) * (
+            1.0 + 0.35 * max(float(r["Crecimiento_ytd"]) - 1.0, 0.0)
+        )
+        pred.append(max(ajustada, piso))
+    d["Pred_estacional"] = pred
+    return d
+
+
+def optimizar_configuracion_modelo_rapido(df, barra=None, estado=None):
+    """Entrena una sola vez y evalúa 175 configuraciones por cálculo vectorial."""
+    if estado is not None:
+        estado.info("Paso 1 de 3: entrenando venta, unidades y precio una sola vez...")
+    base = preparar_backtest_base_2025(df)
+    if base.empty:
+        return pd.DataFrame(), None, None
+
+    configuraciones = [
+        (pe, pf, um)
+        for pe in np.arange(0.00, 0.31, 0.05)
+        for pf in [0.55, 0.65, 0.70, 0.75, 0.85]
+        for um in [1.00, 1.05, 1.10, 1.15, 1.20]
+    ]
+    filas = []
+    mejor_score = float("inf")
+    mejor_bt = None
+    total = len(configuraciones)
+    if estado is not None:
+        estado.info(f"Paso 2 de 3: evaluando {total} configuraciones sin reentrenar...")
+
+    for i, (pe, pf, um) in enumerate(configuraciones, 1):
+        bt = evaluar_configuracion_desde_base(base, float(pe), float(pf), float(um))
+        bt_sc = bt[bt["COMBOS"].astype(int) == 0]
+        if bt_sc.empty:
+            continue
+        m = metricas(bt_sc["Actual"], bt_sc["Pred_estacional"])
+        score = m["WAPE"] + 0.00002 * m["RMSE"] + 0.25 * abs(m["SESGO"])
+        fila = {
+            "Peso_estructural": float(pe),
+            "Peso_forecast_estacional": float(pf),
+            "Umbral_estacional": float(um),
+            **m,
+            "Score": float(score),
+        }
+        filas.append(fila)
+        if score < mejor_score:
+            mejor_score = score
+            mejor_bt = bt.copy()
+        if barra is not None and (i == 1 or i % 5 == 0 or i == total):
+            barra.progress(i / total, text=f"Configuración {i} de {total}")
+
+    tabla = pd.DataFrame(filas).sort_values(["Score", "WAPE", "RMSE"]).reset_index(drop=True)
+    if tabla.empty:
+        return tabla, None, None
+    ganador = tabla.iloc[0].to_dict()
     sesgo = float(ganador["SESGO"])
-
-    # Antisesgo se recomienda, pero no se optimiza contra el mismo 2025 para evitar fuga.
     if sesgo <= -10:
         intensidad, tope = 0.70, 1.10
     elif sesgo <= -5:
@@ -505,7 +573,9 @@ def optimizar_configuracion_modelo(df):
         intensidad, tope = 0.25, 1.04
     ganador["Intensidad_antisesgo"] = intensidad
     ganador["Tope_antisesgo"] = tope
-    return tabla2.reset_index(drop=True), ganador, bt_ganador
+    if estado is not None:
+        estado.success("Paso 3 de 3: optimización terminada. Resultados guardados.")
+    return tabla, ganador, mejor_bt
 
 def grafica_ventas_mensuales(df_historico, pronostico=None, categoria="TODAS",
                              excluir_combos=True, codigo="TODOS"):
@@ -578,6 +648,11 @@ with st.sidebar:
     umbral = st.slider("Umbral estacional Nov-Dic", 1.00, 1.50, 1.10, .05)
     intensidad = st.slider("Intensidad antisesgo", 0.0, 1.0, .60, .05)
     tope = st.slider("Tope factor antisesgo", 1.02, 1.20, 1.10, .01)
+    if st.button("Limpiar resultados de optimización"):
+        for clave in ["tabla_config_completa", "mejor_config", "bt_mejor_config"]:
+            st.session_state.pop(clave, None)
+        preparar_backtest_base_2025.clear()
+        st.rerun()
 
 if archivos:
     try:
@@ -613,11 +688,24 @@ if archivos:
             "recomienda de forma conservadora para evitar sobreajustar 2025."
         )
         if st.button("Buscar mejor configuración completa", type="primary"):
-            with st.spinner("Evaluando configuraciones. Puede tardar varios minutos..."):
-                tabla_config, mejor_config, bt_mejor_config = optimizar_configuracion_modelo(df)
-            st.session_state["tabla_config_completa"] = tabla_config
-            st.session_state["mejor_config"] = mejor_config
-            st.session_state["bt_mejor_config"] = bt_mejor_config
+            barra_opt = st.progress(0, text="Preparando optimización...")
+            estado_opt = st.empty()
+            try:
+                tabla_config, mejor_config, bt_mejor_config = optimizar_configuracion_modelo_rapido(
+                    df, barra=barra_opt, estado=estado_opt
+                )
+                if mejor_config is None or tabla_config.empty:
+                    st.error("La optimización terminó sin resultados. Verifica que existan datos reales de noviembre y diciembre de 2025.")
+                else:
+                    st.session_state["tabla_config_completa"] = tabla_config
+                    st.session_state["mejor_config"] = mejor_config
+                    st.session_state["bt_mejor_config"] = bt_mejor_config
+                    barra_opt.progress(1.0, text="Optimización completada")
+                    st.rerun()
+            except Exception as error_opt:
+                barra_opt.empty()
+                estado_opt.empty()
+                st.exception(error_opt)
 
         if st.session_state.get("mejor_config") is not None:
             mejor_config = st.session_state["mejor_config"]
@@ -811,4 +899,5 @@ if archivos:
         st.exception(e)
 else:
     st.info("Carga los tres archivos Excel para comenzar.")
+
 
