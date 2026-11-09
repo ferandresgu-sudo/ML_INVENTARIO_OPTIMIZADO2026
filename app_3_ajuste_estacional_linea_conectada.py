@@ -437,10 +437,11 @@ def crecimiento_ytd(historial, ano_objetivo):
 
 
 def aplicar_ajuste_estacional(pred_base, historial, periodo):
-    """Ajuste estacional suave, sin piso rígido igual al año anterior.
+    """Ajuste estacional con piso parcial, no rígido.
 
-    Devuelve la predicción y valores de diagnóstico para verificar cuánto aportó
-    CatBoost, la referencia histórica y la tendencia YTD.
+    La referencia del año anterior protege contra subestimaciones extremas, pero
+    nunca sustituye automáticamente la predicción. Si el modelo queda debajo del
+    piso parcial, solo se recupera 40% de la distancia hacia dicho piso.
     """
     mes = periodo % 100
     ano = periodo // 100
@@ -459,6 +460,9 @@ def aplicar_ajuste_estacional(pred_base, historial, periodo):
         "Referencia_YTD": np.nan,
         "Prediccion_estacional": float(pred_base),
         "Referencia_suavizada": np.nan,
+        "Prediccion_combinada": float(pred_base),
+        "Piso_parcial": np.nan,
+        "Correccion_piso": 0.0,
         "Ajuste_aplicado": False,
     }
 
@@ -481,8 +485,7 @@ def aplicar_ajuste_estacional(pred_base, historial, periodo):
         + (1.0 - PESO_FORECAST_ESTACIONAL) * referencia_ytd
     )
 
-    # La tendencia YTD se transfiere parcialmente. Se permite que el forecast
-    # quede hasta 10% por debajo o 20% por encima del mismo mes anterior.
+    # Referencia suavizada: transfiere 50% de la tendencia YTD y la limita.
     crecimiento_suavizado = float(np.clip(
         1.0 + 0.50 * (crec - 1.0),
         0.90,
@@ -490,11 +493,28 @@ def aplicar_ajuste_estacional(pred_base, historial, periodo):
     ))
     referencia_suavizada = ultimo_ano * crecimiento_suavizado
 
-    # La referencia ya no es un piso obligatorio. Solo aporta 15% adicional.
-    prediccion_final = (
-        0.85 * prediccion_estacional
-        + 0.15 * referencia_suavizada
+    # Ensamble principal: 90% señal del modelo estacional, 10% referencia suave.
+    prediccion_combinada = (
+        0.90 * float(prediccion_estacional)
+        + 0.10 * float(referencia_suavizada)
     )
+
+    # Piso PARCIAL: acepta disminuciones, pero controla caídas extremas.
+    # El piso puede estar entre 94% y 115% del mismo mes del último año.
+    factor_piso = float(np.clip(
+        1.0 + 0.35 * (crec - 1.0),
+        0.94,
+        1.15,
+    ))
+    piso_parcial = ultimo_ano * factor_piso
+
+    # Si queda debajo, solo recupera 40% de la distancia. No copia el piso.
+    if prediccion_combinada < piso_parcial:
+        correccion_piso = 0.40 * (piso_parcial - prediccion_combinada)
+        prediccion_final = prediccion_combinada + correccion_piso
+    else:
+        correccion_piso = 0.0
+        prediccion_final = prediccion_combinada
 
     diagnostico.update({
         "Referencia_ultimo_ano": ultimo_ano,
@@ -503,6 +523,9 @@ def aplicar_ajuste_estacional(pred_base, historial, periodo):
         "Referencia_YTD": float(referencia_ytd),
         "Prediccion_estacional": float(prediccion_estacional),
         "Referencia_suavizada": float(referencia_suavizada),
+        "Prediccion_combinada": float(prediccion_combinada),
+        "Piso_parcial": float(piso_parcial),
+        "Correccion_piso": float(correccion_piso),
         "Ajuste_aplicado": True,
     })
     return max(0.0, float(prediccion_final)), diagnostico
@@ -529,7 +552,7 @@ def calcular_metricas(y_real, y_pred):
 
 
 @st.cache_data(show_spinner=False)
-def backtest_suavizado_nov_dic_2025(df, version="suavizado-backtest-v1"):
+def backtest_suavizado_nov_dic_2025(df, version="piso-parcial-backtest-v1"):
     """Entrena hasta octubre 2025 y predice Nov-Dic 2025 con la regla suavizada."""
     train = df[df["Periodo"] < 202511].copy()
     real = df[df["Periodo"].isin([202511, 202512])].copy()
@@ -569,6 +592,9 @@ def backtest_suavizado_nov_dic_2025(df, version="suavizado-backtest-v1"):
                 "Crecimiento_YTD": diag["Crecimiento_YTD"],
                 "Prediccion_estacional": diag["Prediccion_estacional"],
                 "Referencia_suavizada": diag["Referencia_suavizada"],
+                "Prediccion_combinada": diag["Prediccion_combinada"],
+                "Piso_parcial": diag["Piso_parcial"],
+                "Correccion_piso": diag["Correccion_piso"],
                 "Ajuste_aplicado": diag["Ajuste_aplicado"],
                 "Prediccion_final": float(pred_final),
             })
@@ -592,7 +618,7 @@ def tabla_metricas_por_categoria(detalle):
 
 
 @st.cache_data(show_spinner=False)
-def generar_forecast(df, version_modelo="ajuste-suavizado-v2"):
+def generar_forecast(df, version_modelo="piso-parcial-v1"):
     modelos = entrenar_modelos(df)
     filas = []
     periodos = [202611, 202612]
@@ -643,6 +669,9 @@ def generar_forecast(df, version_modelo="ajuste-suavizado-v2"):
                 "Referencia_YTD": diag["Referencia_YTD"],
                 "Prediccion_estacional": diag["Prediccion_estacional"],
                 "Referencia_suavizada": diag["Referencia_suavizada"],
+                "Prediccion_combinada": diag["Prediccion_combinada"],
+                "Piso_parcial": diag["Piso_parcial"],
+                "Correccion_piso": diag["Correccion_piso"],
                 "Indice_estacional": diag["Indice_estacional"],
                 "Ajuste_aplicado": diag["Ajuste_aplicado"],
                 "Prediccion_final": float(final),
@@ -734,11 +763,11 @@ if archivos:
             )
             st.stop()
 
-        st.markdown("### Validación del ajuste suavizado")
+        st.markdown("### Validación del ajuste con piso parcial")
         excluir_combos_bt = st.checkbox(
             "Excluir combos del backtest", value=True, key="excluir_combos_backtest"
         )
-        if st.button("Calcular métricas Nov-Dic 2025", type="primary"):
+        if st.button("Calcular métricas del piso parcial Nov-Dic 2025", type="primary"):
             progreso_bt = st.progress(0, text="Entrenando únicamente hasta octubre de 2025...")
             try:
                 detalle_bt = backtest_suavizado_nov_dic_2025(df)
@@ -769,7 +798,7 @@ if archivos:
                 m5.metric("Sesgo", f"{metricas_bt['SESGO']:+.2f}%")
                 st.caption(
                     f"Venta real: ${metricas_bt['REAL']:,.2f} | "
-                    f"Pronóstico suavizado: ${metricas_bt['PRED']:,.2f} | "
+                    f"Pronóstico con piso parcial: ${metricas_bt['PRED']:,.2f} | "
                     f"{evaluado_bt['CODIGO'].nunique():,} SKU"
                 )
 
@@ -968,6 +997,7 @@ if archivos:
                     "CODIGO", "DESCRIPCION", "CATEGORIA", "Periodo",
                     "Prediccion_base", "Referencia_ultimo_ano", "Crecimiento_YTD",
                     "Referencia_YTD", "Prediccion_estacional", "Referencia_suavizada",
+                    "Prediccion_combinada", "Piso_parcial", "Correccion_piso",
                     "Indice_estacional", "Ajuste_aplicado", "Prediccion_final",
                 ]
                 st.dataframe(
@@ -986,6 +1016,3 @@ if archivos:
         st.exception(error)
 else:
     st.info("Carga los tres archivos Excel para comenzar.")
-
-
-
